@@ -1,105 +1,136 @@
 # k8s-multiservice-demo
 
-A three-service application containerized with Docker and deployed to a local Kubernetes cluster.
-
-The deployment itself is deliberately ordinary. The point of this repo is the second half: a set of documented experiments in breaking health checks, to show the difference between a pod that is *running* and an application that *works*.
-
-> **Status:** work in progress. Manifests and failure notes are being added as I build.
-
----
+A small three-service app whose real purpose is to teach Kubernetes
+**health checks** — specifically, the gap between a pod being `Running` and the
+app inside it actually *working*.
 
 ## Why this exists
 
-A pod reporting `Running` tells you that a container process started. It tells you nothing about whether the application inside it can serve a request.
+A container can be `Running` — the process started, the port is open — while the
+application is still useless: the database isn't connected yet, a dependency is
+down, or a request hangs forever. Kubernetes only knows the difference if you
+give it **probes**:
 
-That gap is well documented and easy to read about. It is much less easy to recognise at three in the morning when a service is up, healthy by every dashboard, and returning errors. This repo is my attempt to cause each of those failures on purpose, in a controlled environment, and write down what they actually look like.
+- a **liveness** probe (is the process wedged? if so, restart it), and
+- a **readiness** probe (should this pod receive traffic *right now*?).
 
-## Architecture
+Get these wrong and you get user-visible failures that look like "it's Running,
+why is it broken?" This project is built to *reproduce* those failures on
+purpose, so the fix is memorable rather than theoretical.
+
+The API is deliberately shaped for three later experiments:
+
+- **no readiness probe** — traffic hits a pod that isn't ready yet.
+- **a too-shallow readiness probe** — using `/healthz` (which never touches the
+  DB) as readiness, so the pod is marked ready before the DB is.
+- **a too-aggressive liveness probe** — a timeout short enough that the `/slow`
+  endpoint trips it and the pod gets killed mid-request.
+
+To make the not-ready window easy to observe, the API **sleeps 15s on startup
+before it even tries to connect to Postgres** (`STARTUP_DELAY`). That delay is
+intentional — don't "fix" it.
+
+## Eventual architecture
 
 ```
-          ┌──────────────┐
-          │   frontend   │   nginx, serves static page, proxies /api
-          │  (NodePort)  │
-          └──────┬───────┘
-                 │
-          ┌──────▼───────┐
-          │     api      │   FastAPI, reads/writes the database
-          │ (ClusterIP)  │   liveness + readiness probes live here
-          └──────┬───────┘
-                 │
-          ┌──────▼───────┐
-          │      db      │   PostgreSQL, backed by a PVC
-          │ (ClusterIP)  │
-          └──────────────┘
+  browser ──▶ nginx frontend ──/api──▶ FastAPI ──▶ Postgres
+              (static page +           (asyncpg
+               reverse proxy)           pool)
 ```
 
-**Kubernetes objects used:** Deployment, Service, ConfigMap, Secret, PersistentVolumeClaim, and liveness/readiness/startup probes.
+Three services on a local [kind](https://kind.sigs.k8s.io/) cluster. nginx serves
+the static page and reverse-proxies `/api` to the FastAPI service; FastAPI owns
+an `items` table in Postgres.
 
-## Repository layout
+## Status
 
-```
-.
-├── app/
-│   ├── api/            FastAPI service + Dockerfile
-│   └── frontend/       nginx config, static page + Dockerfile
-├── k8s/                manifests, applied in numeric order
-├── docs/
-│   └── probes.md       the failure experiments
-└── Makefile            up / down / reset
-```
+**Day 1 — application layer only.** The two service images build and run under
+plain Docker. There are **no Kubernetes manifests yet** (no kind cluster, no
+Deployments, no probes, no nginx `/api` proxy config) — those come in a later
+session. Because the nginx proxy config isn't wired up yet, the frontend's
+button won't reach the API when run under Docker alone; that connection is part
+of the Kubernetes work.
 
-## Running it locally
+## API endpoints
 
-Requires [kind](https://kind.sigs.k8s.io/) (or minikube), `kubectl`, and Docker.
+| Endpoint        | Purpose                                                            |
+| --------------- | ----------------------------------------------------------------- |
+| `GET /healthz`  | Liveness. 200 if the process is alive. **Never touches the DB.**  |
+| `GET /readyz`   | Readiness. 200 only if the DB pool exists and `SELECT 1` works; otherwise 503 with a reason. |
+| `GET /slow`     | Sleeps `SLOW_DELAY` seconds (default 5), then 200.                |
+| `GET /items`    | List rows from the `items` table.                                 |
+| `POST /items`   | Insert a row: `{"name": "..."}`.                                  |
+
+### Configuration (environment variables)
+
+| Var             | Default     | Meaning                                   |
+| --------------- | ----------- | ----------------------------------------- |
+| `DB_HOST`       | `localhost` | Postgres host                             |
+| `DB_PORT`       | `5432`      | Postgres port                             |
+| `DB_NAME`       | `demo`      | Database name                             |
+| `DB_USER`       | `demo`      | Database user                             |
+| `DB_PASSWORD`   | `demo`      | Database password                         |
+| `STARTUP_DELAY` | `15`        | Seconds to wait before connecting to DB   |
+| `SLOW_DELAY`    | `5`         | Seconds `/slow` sleeps                     |
+
+## Day-1 run instructions (Docker only)
 
 ```bash
-# create the cluster and load images
-make up
+# 1. Network + Postgres
+docker network create demo
+docker run -d --name db --network demo \
+  -e POSTGRES_DB=demo -e POSTGRES_USER=demo -e POSTGRES_PASSWORD=demo \
+  postgres:16-alpine
 
-# check what came up
-kubectl get pods -n demo
-
-# open the frontend
-kubectl port-forward -n demo svc/frontend 8080:80
+# 2. Build and run the API
+docker build -t demo/api:local app/api
+docker run -d --name api --network demo -p 8000:8000 \
+  -e DB_HOST=db -e DB_PASSWORD=demo demo/api:local
 ```
 
-Then visit `http://localhost:8080`.
+Watch the readiness window (the API sleeps 15s, then connects):
 
 ```bash
-# tear everything down
-make down
+# 503 in the first ~15s, then 200
+curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/readyz
+
+# 200 immediately, even while readyz is still 503 — it never touches the DB
+curl -s -o /dev/null -w '%{http_code}\n' localhost:8000/healthz
 ```
 
-## The probe experiments
+Exercise the real endpoints:
 
-Full write-ups with output and screenshots are in [`docs/probes.md`](docs/probes.md). Summary:
+```bash
+curl -s -X POST localhost:8000/items \
+  -H 'Content-Type: application/json' -d '{"name":"widget"}'
+curl -s localhost:8000/items
+```
 
-### 1. No readiness probe
+Build and serve the frontend page:
 
-The API pod reports `Running` as soon as its process starts, before it has connected to the database. The Service adds it to the endpoint list immediately, and traffic is routed to a pod that cannot serve it.
+```bash
+docker build -t demo/frontend:local app/frontend
+docker run -d --name frontend --network demo -p 8080:80 demo/frontend:local
+# open http://localhost:8080
+```
 
-**What it looks like:** healthy pod list, failing requests.
+Clean up:
 
-### 2. A readiness probe that checks too little
+```bash
+docker rm -f db api frontend
+docker network rm demo
+```
 
-The probe hits an endpoint that returns `200` if the HTTP server is up, without touching the database. The pod is marked ready. The database connection is dead. Requests still fail.
+## Repo layout
 
-**What it looks like:** identical to a healthy cluster, from the outside.
-
-### 3. A liveness probe that is too aggressive
-
-`timeoutSeconds` set below the API's real response time under load. Kubernetes concludes the container is hung and restarts it. Under sustained load this becomes a restart loop.
-
-**What it looks like:** an outage caused by the mechanism intended to prevent one.
-
-## Notes
-
-This is a learning project, not a production reference. In particular: secrets are committed as plain manifests for reproducibility, there is no TLS, no resource limits tuning, and no Ingress controller. Do not copy the manifests into anything real without addressing those.
-
-## Background
-
-I taught biology for a long time before moving into infrastructure work. The habit I brought with me is that a result you have not tested is a hypothesis, not a finding — which is roughly how I have come to treat health checks.
-
----
-
-**Author:** Anush Barseghyan · [LinkedIn](https://www.linkedin.com/in/anush-barseghyan/)
+```
+app/
+  api/          FastAPI service (asyncpg pool, health endpoints)
+    main.py
+    requirements.txt
+    Dockerfile
+    .dockerignore
+  frontend/     nginx static page (proxy config comes later, from a ConfigMap)
+    index.html
+    Dockerfile
+```
