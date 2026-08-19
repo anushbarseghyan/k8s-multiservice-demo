@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>k8s-multiservice-demo</title>
+  <style>
+    body {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      max-width: 720px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      background: #111;
+      color: #eee;
+      line-height: 1.5;
+    }
+    h1 { font-size: 1.2rem; }
+    button {
+      font-family: inherit;
+      font-size: 1rem;
+      padding: 0.5rem 1rem;
+      cursor: pointer;
+      background: #222;
+      color: #eee;
+      border: 1px solid #555;
+    }
+    button:hover { background: #333; }
+    #out {
+      margin-top: 1rem;
+      padding: 1rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      border: 1px solid #555;
+      border-radius: 4px;
+    }
+    .ok    { border-color: #2ecc71; background: #0f2417; color: #b6f5cf; }
+    .error { border-color: #e74c3c; background: #2a1414; color: #f7c3bd; }
+    .status { font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>k8s-multiservice-demo</h1>
+  <p>Fetches <code>/api/items</code> from the API (proxied by nginx later).</p>
+  <button id="load">GET /api/items</button>
+  <div id="out">click the button</div>
+
+  <script>
+    const out = document.getElementById("out");
+    document.getElementById("load").addEventListener("click", async () => {
+      out.className = "";
+      out.textContent = "loading...";
+      try {
+        const res = await fetch("/api/items");
+        const body = await res.text();
+        out.className = res.ok ? "ok" : "error";
+        out.innerHTML =
+          '<div class="status">HTTP ' + res.status + " " + res.statusText + "</div>" +
+          "<div>" + escapeHtml(body) + "</div>";
+      } catch (err) {
+        out.className = "error";
+        out.innerHTML =
+          '<div class="status">request failed</div><div>' +
+          escapeHtml(String(err)) + "</div>";
+      }
+    });
+
+    function escapeHtml(s) {
+      return s
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+  </script>
+</body>
+</html>
