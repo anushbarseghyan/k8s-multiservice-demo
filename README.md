@@ -44,12 +44,23 @@ an `items` table in Postgres.
 
 ## Status
 
-**Day 1 — application layer only.** The two service images build and run under
-plain Docker. There are **no Kubernetes manifests yet** (no kind cluster, no
-Deployments, no probes, no nginx `/api` proxy config) — those come in a later
-session. Because the nginx proxy config isn't wired up yet, the frontend's
-button won't reach the API when run under Docker alone; that connection is part
-of the Kubernetes work.
+**Day 2 — running on a kind cluster.** All three services run on a single-node
+[kind](https://kind.sigs.k8s.io/) cluster with a one-command bring-up
+(`make up`). The nginx `/api` reverse-proxy is now wired up from a ConfigMap, so
+the frontend button reaches the API end-to-end. The probes are set **correctly**
+in this baseline:
+
+- **liveness** → `/healthz` (never touches the DB, so a slow DB won't get the
+  pod killed), and
+- **readiness** → `/readyz` (503 until the DB pool works, so the ~15s
+  `STARTUP_DELAY` keeps the pod out of the Service until it can actually serve).
+
+Still to come: the three intentional **broken-probe experiments** (no readiness,
+too-shallow readiness, too-aggressive liveness) that reproduce the failures this
+project exists to teach.
+
+See [`k8s/`](k8s/), the [`Makefile`](Makefile), and the design/plan docs under
+[`docs/superpowers/`](docs/superpowers/).
 
 ## API endpoints
 
@@ -73,7 +84,35 @@ of the Kubernetes work.
 | `STARTUP_DELAY` | `15`        | Seconds to wait before connecting to DB   |
 | `SLOW_DELAY`    | `5`         | Seconds `/slow` sleeps                     |
 
-## Day-1 run instructions (Docker only)
+## Run on kind (Day 2)
+
+Prerequisites: Docker running, `kubectl`, and `kind` (`brew install kind`).
+
+```bash
+make up      # create cluster, build + load images, apply manifests, wait for Ready
+make status  # kubectl get pods,svc
+# open http://localhost:8080 and click the button
+make down     # delete the cluster
+```
+
+Watch the "Running but not Ready" window — the api pod stays **out of the
+Service** for ~15s after it starts, until `/readyz` goes green:
+
+```bash
+# empty for ~15s after the api pod (re)starts, then populated with one endpoint
+kubectl get endpoints api
+
+# reach the API through the nginx proxy
+curl -s localhost:8080/api/items -w '\nHTTP %{http_code}\n'
+curl -s -X POST localhost:8080/api/items \
+  -H 'Content-Type: application/json' -d '{"name":"widget"}'
+```
+
+## Alternative: plain Docker (no Kubernetes)
+
+Runs the two images directly under Docker. Note the frontend's button won't
+reach the API this way — the nginx `/api` proxy only exists in the Kubernetes
+ConfigMap, so use `curl` against the API port directly.
 
 ```bash
 # 1. Network + Postgres
@@ -130,7 +169,15 @@ app/
     requirements.txt
     Dockerfile
     .dockerignore
-  frontend/     nginx static page (proxy config comes later, from a ConfigMap)
+  frontend/     nginx static page (the /api proxy comes from the ConfigMap below)
     index.html
     Dockerfile
+k8s/            Kubernetes manifests (applied to a kind cluster)
+  kind-config.yaml   1-node cluster, maps localhost:8080 -> NodePort 30080
+  postgres.yaml      Postgres Deployment (emptyDir) + db Service
+  api.yaml           API Deployment + Service, liveness /healthz + readiness /readyz
+  frontend.yaml      nginx /api-proxy ConfigMap + Deployment + NodePort Service
+Makefile        up / down / status / logs-api helpers
+docs/
+  superpowers/  design spec and implementation plan for the k8s baseline
 ```

@@ -166,6 +166,11 @@ spec:
     metadata:
       labels: { app: api }
     spec:
+      # Kubernetes injects legacy Docker-link env vars for every Service (the db
+      # Service -> DB_PORT=tcp://<clusterIP>:5432), which shadows the app's own
+      # DB_PORT and crashes it at startup. Disable the injection; the app reaches
+      # Postgres via DNS (DB_HOST=db), not these vars.
+      enableServiceLinks: false
       containers:
         - name: api
           image: demo/api:local
@@ -174,6 +179,7 @@ spec:
             - containerPort: 8000
           env:
             - { name: DB_HOST, value: db }
+            - { name: DB_PORT, value: "5432" }   # explicit; overrides any injected link var
             - { name: DB_PASSWORD, value: demo }
           # Liveness: shallow, never touches the DB. A slow/unready DB must NOT
           # get this container restarted.
